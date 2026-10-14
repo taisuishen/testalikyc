@@ -1,0 +1,7 @@
+# never commit local secrets or captured documents
+certs/
+captures/
+node_modules/
+.DS_Store
+*.log
+.vercel

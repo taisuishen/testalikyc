@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="theme-color" content="#101216" />
+  <title>证件检测 · 自动截取</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div id="app">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="overlay"></canvas>
+
+    <button id="start">开始采集</button>
+
+    <div id="hud">
+      <div id="tip" data-state="wait">正在启动摄像头…</div>
+      <div id="meter"><div id="meterFill"></div></div>
+    </div>
+
+    <div id="debug"></div>
+
+    <div id="result" hidden>
+      <img id="shot" alt="已截取的证件" />
+      <pre id="resultInfo"></pre>
+      <button id="retake">重新拍摄</button>
+    </div>
+  </div>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

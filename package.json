@@ -1,0 +1,11 @@
+{
+  "name": "docscan-h5",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Document capture H5: card detection, auto-capture, perspective correction",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test/detect.test.mjs"
+  }
+}
