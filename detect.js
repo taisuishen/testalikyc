@@ -22,7 +22,12 @@ import {
 
 /** Default gates. Tune per document type, mirroring doc.Config in the SDK. */
 export const DEFAULT_CONFIG = {
-  minAreaRatio: 0.25,     // card must cover >= 25% of the frame
+  // ID-1 format (most ID cards, incl. Philippine PhilSys): 85.60 x 53.98 mm.
+  // Passports are TD3 (125 x 88 mm, ratio 1.42) — override per document type.
+  guideAspect: 1.585,
+  aspectTolerance: 0.30,  // allowed RELATIVE deviation from guideAspect
+  minAreaRatio: 0.45,     // card area / GUIDE area  (not image area)
+  maxAreaRatio: 1.35,     // above this the card overflows the guide: move back
   maxAngleDeg: 12,        // worst interior-angle deviation from 90deg
   maxCornerJitter: 6,     // px at detection scale, for temporal stability
   blurMin: 60,            // Laplacian variance floor (native-res crop)
@@ -30,7 +35,7 @@ export const DEFAULT_CONFIG = {
   brightnessMax: 225,     // mean luma ceiling
   glareMax: 0.06,         // fraction of near-white pixels
   stackTime: 900,         // ms of continuous validity before auto-capture
-  hysteresis: { enter: 0.72, exit: 0.5 }, // ratio thresholds for lock/unlock
+  hysteresis: { enter: 1.0, exit: 0.8 }, // area thresholds while timing
 };
 
 /* ------------------------------------------------------------------ */
@@ -145,26 +150,52 @@ export function dilate(bin, w, h, iterations = 1) {
 }
 
 /**
- * Largest 8-connected component. Also reports whether it touches the frame
- * border — that is the practical test for "all four corners visible": a card
- * that is partially out of frame produces a blob clipped by the image edge.
+ * Pick the component that best represents the document.
+ *
+ * `guide` (optional, in this image's coordinate space) is the on-screen capture
+ * rectangle. When supplied, only components whose centroid lands inside the
+ * guide (plus a little slack) are eligible. That containment test is a hard
+ * filter rather than a score bonus, because a table edge or monitor bezel in
+ * the background can easily be larger than the card and would otherwise win.
+ *
+ * Selection is by bounding-box AREA, not raw pixel count: a card outline is a
+ * thin ring whose pixel count is far below the area it encloses, so counting
+ * pixels favours dense background texture over the card border.
+ *
+ * `touchesBorder` is the practical test for "all four corners visible" — a card
+ * partly out of frame yields a blob clipped by the image edge.
  */
-export function largestComponent(bin, w, h) {
+export function selectComponent(bin, w, h, guide = null) {
   const seen = new Uint8Array(w * h);
   const stack = new Int32Array(w * h);
+  const slack = 0.10;
+  const gx0 = guide ? guide.x - guide.width * slack : 0;
+  const gy0 = guide ? guide.y - guide.height * slack : 0;
+  const gx1 = guide ? guide.x + guide.width * (1 + slack) : w;
+  const gy1 = guide ? guide.y + guide.height * (1 + slack) : h;
+
   let best = null;
-  let bestCount = 0;
+  let bestScore = -1;
+  let sawAny = false;
+
   for (let start = 0; start < bin.length; start++) {
     if (!bin[start] || seen[start]) continue;
     let sp = 0;
     stack[sp++] = start;
     seen[start] = 1;
     const pixels = [];
-    let touches = false;
+    let count = 0, sumX = 0, sumY = 0;
+    let minX = w, minY = h, maxX = -1, maxY = -1, touches = false;
+
     while (sp > 0) {
       const idx = stack[--sp];
       pixels.push(idx);
       const x = idx % w, y = (idx / w) | 0;
+      count++; sumX += x; sumY += y;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
       if (x === 0 || y === 0 || x === w - 1 || y === h - 1) touches = true;
       for (let dy = -1; dy <= 1; dy++) {
         const yy = y + dy;
@@ -177,17 +208,24 @@ export function largestComponent(bin, w, h) {
         }
       }
     }
-    if (pixels.length > bestCount) { bestCount = pixels.length; best = pixels; }
-  }
-  return best ? { pixels: best, touchesBorder: best.length && touchesFrame(best, w, h) } : null;
-}
 
-function touchesFrame(pixels, w, h) {
-  for (const idx of pixels) {
-    const x = idx % w, y = (idx / w) | 0;
-    if (x === 0 || y === 0 || x === w - 1 || y === h - 1) return true;
+    sawAny = true;
+    const cx = sumX / count, cy = sumY / count;
+    if (guide && (cx < gx0 || cx > gx1 || cy < gy0 || cy > gy1)) continue;
+
+    const bboxArea = (maxX - minX + 1) * (maxY - minY + 1);
+    if (bboxArea > bestScore) {
+      bestScore = bboxArea;
+      best = {
+        pixels,
+        count,
+        touchesBorder: touches,
+        bbox: { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 },
+        centroid: [cx, cy],
+      };
+    }
   }
-  return false;
+  return { component: best, sawAny };
 }
 
 /* ------------------------------------------------------------------ */
@@ -242,16 +280,75 @@ export function rdp(points, eps) {
   return out;
 }
 
-/** Pick the largest-area convex quad from a small point set. */
-function bestFourByArea(pts) {
-  let bestQ = null, bestA = -1;
+/**
+ * RDP for a CLOSED polygon.
+ *
+ * Running plain RDP on a closed hull as if it were an open polyline is wrong:
+ * the first and last vertices are adjacent, both get force-kept, and you end up
+ * with a spurious vertex at the seam while real corners get dropped — which is
+ * what produced quads with two corners collapsed onto the same edge.
+ *
+ * The correct treatment splits the ring at the vertex farthest from the start,
+ * simplifies each half, then rejoins without duplicating the shared endpoints.
+ */
+export function rdpClosed(pts, eps) {
   const n = pts.length;
-  for (let a = 0; a < n; a++)
-    for (let b = a + 1; b < n; b++)
-      for (let c = b + 1; c < n; c++)
+  if (n < 4) return pts.slice();
+  let far = 0, best = -1;
+  for (let i = 1; i < n; i++) {
+    const d = (pts[i][0] - pts[0][0]) ** 2 + (pts[i][1] - pts[0][1]) ** 2;
+    if (d > best) { best = d; far = i; }
+  }
+  const half1 = pts.slice(0, far + 1);
+  const half2 = pts.slice(far).concat([pts[0]]);
+  const a = rdp(half1, eps);
+  const b = rdp(half2, eps);
+  return a.concat(b.slice(1, -1));
+}
+
+/**
+ * Reject degenerate quads.
+ *
+ * The failure this guards against: all four vertices are real hull points, the
+ * shape is convex and has decent area, but one edge has collapsed — e.g. two
+ * corners sitting on the same card edge, 9px apart. Such a shape reports the
+ * wrong area and the wrong aspect, so gates pass intermittently, the progress
+ * bar keeps resetting and the capture never locks.
+ *
+ * An ID card's short side is ~63% of its long side (ID-1 is 1.585:1), so even
+ * under noticeable perspective no side should fall below ~28% of the longest.
+ */
+function wellFormed(q) {
+  const sides = q.map((p, i) => {
+    const r = q[(i + 1) % 4];
+    return Math.hypot(r[0] - p[0], r[1] - p[1]);
+  });
+  const maxS = Math.max(...sides);
+  if (Math.min(...sides) < maxS * 0.28) return false;
+  // Opposite sides of a (near-)parallelogram stay comparable under perspective.
+  if (Math.min(sides[0], sides[2]) < Math.max(sides[0], sides[2]) * 0.4) return false;
+  if (Math.min(sides[1], sides[3]) < Math.max(sides[1], sides[3]) * 0.4) return false;
+  return true;
+}
+
+/**
+ * Pick the max-area well-formed convex quad from a point set.
+ *
+ * The point set must still CONTAIN the true corners — searching an
+ * over-simplified polygon is what produced collapsed edges, so callers pass a
+ * lightly-reduced hull rather than an aggressively simplified one.
+ */
+export function maxAreaQuad(pts) {
+  const n = pts.length;
+  if (n < 4) return null;
+  let bestQ = null, bestA = -1;
+  for (let a = 0; a < n - 3; a++)
+    for (let b = a + 1; b < n - 2; b++)
+      for (let c = b + 1; c < n - 1; c++)
         for (let d = c + 1; d < n; d++) {
           const q = [pts[a], pts[b], pts[c], pts[d]];
           if (!isConvex(q)) continue;
+          if (!wellFormed(q)) continue;
           const area = polygonArea(q);
           if (area > bestA) { bestA = area; bestQ = q; }
         }
@@ -259,22 +356,38 @@ function bestFourByArea(pts) {
 }
 
 /**
- * Reduce a convex hull to exactly 4 corners by sweeping the RDP epsilon,
- * falling back to the maximal convex quad when the sweep skips past 4.
+ * Reduce a convex hull to exactly 4 corners.
+ *
+ * Primary path sweeps the RDP epsilon on the closed ring and takes the first
+ * result that has exactly four well-formed vertices. RDP can step from five
+ * vertices straight to three, so the fallback searches a LIGHTLY reduced hull
+ * (1% of perimeter) rather than the last aggressive simplification — that keeps
+ * the true corners inside the candidate pool.
  */
 export function approxQuad(hull) {
   if (hull.length < 4) return null;
-  if (hull.length === 4) return hull.slice();
+  if (hull.length === 4) return wellFormed(hull) ? hull.slice() : null;
+
   const peri = perimeter(hull);
-  let fallback = null;
-  for (let k = 2; k <= 60; k++) {
-    const eps = (peri * k) / 400;
-    const a = rdp(hull, eps);
-    if (a.length === 4) return a;
-    if (a.length > 4 && a.length <= 9) fallback = a;
-    if (a.length < 4) break;
+
+  // Light reduction only, tightening just enough to bound the combinatorics.
+  // A small epsilon keeps every real corner (corner deviations are tens of px
+  // while edge noise is sub-pixel) and only bounds the search space.
+  let pool = hull;
+  for (const frac of [0.004, 0.008, 0.015, 0.03, 0.06]) {
+    const r = rdpClosed(hull, Math.max(1.0, peri * frac));
+    if (r.length >= 4) pool = r;
+    if (pool.length <= 20) break;
   }
-  return fallback ? bestFourByArea(fallback) : null;
+  if (pool.length > 30) return null;   // refuse rather than emit a bad quad
+
+  // Max-enclosed-area is the robust corner objective: a point in the middle of
+  // an edge can never increase the area, so true corners win by construction.
+  const q = maxAreaQuad(pool);
+  if (q) return q;
+
+  const coarse = rdpClosed(hull, peri * 0.03);
+  return coarse.length === 4 && wellFormed(coarse) ? coarse : null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -283,12 +396,16 @@ export function approxQuad(hull) {
 
 /**
  * Detect a document quad in one downscaled frame.
+ *
  * @param {{data:Uint8ClampedArray,width:number,height:number}} img
  * @param {object} [cfg]
- * @returns {{quad:number[][], areaRatio:number, maxAngleDev:number,
- *            touchesBorder:boolean, coverage:number, stage:string}|null}
+ * @param {{x:number,y:number,width:number,height:number}} [guide]
+ *        The capture rectangle in THIS image's coordinate space. When supplied,
+ *        areaRatio is measured against the guide (matching the SDK's
+ *        checkCardAreaRatio(cardQuad, frameQuad, min)), and only components
+ *        centred inside it are eligible.
  */
-export function detectDocument(img, cfg = {}) {
+export function detectDocument(img, cfg = {}, guide = null) {
   const c = { ...DEFAULT_CONFIG, ...cfg };
   const { width: w, height: h } = img;
   if (!w || !h) return null;
@@ -296,14 +413,19 @@ export function detectDocument(img, cfg = {}) {
   const gray = toGray(img.data, w, h);
   const blur = gaussianBlur(gray, w, h);
   const mag = sobelMagnitude(blur, w, h);
-  const { bin, thr } = binarize(mag, w, h);
+  const { bin } = binarize(mag, w, h);
   const dil = dilate(bin, w, h, 2);
-  const comp = largestComponent(dil, w, h);
-  if (!comp) return { failed: "no-component" };
+
+  const { component: comp, sawAny } = selectComponent(dil, w, h, guide);
+  if (!comp) {
+    // Distinguish "nothing anywhere" from "something, but not in the guide"
+    // so the UI can say "put it in the frame" rather than "no document".
+    return { failed: sawAny && guide ? "outside-guide" : "no-component" };
+  }
 
   // Keep this floor low: a genuinely small card must still produce a quad so
-  // the area gate can answer "move closer" instead of reporting "no document".
-  const coverage = comp.pixels.length / (w * h);
+  // the area gate can answer "move closer" instead of "no document".
+  const coverage = comp.count / (w * h);
   if (coverage < 0.005) return { failed: "component-too-small", coverage };
 
   // Subsample for hull cost; hull is unaffected at these densities.
@@ -320,19 +442,25 @@ export function detectDocument(img, cfg = {}) {
   const quad = orderQuad(quadRaw);
   if (!isConvex(quad)) return { failed: "not-convex", coverage };
 
-  const areaRatio = polygonArea(quad) / (w * h);
-  const maxAngleDev = maxAngleDeviation(quad);
-  const minSide = Math.min(
-    ...quad.map((p, i) => Math.hypot(...quad[(i + 1) % 4].map((v, k) => v - p[k]))),
-  );
+  const cardArea = polygonArea(quad);
+  const refArea = guide ? guide.width * guide.height : w * h;
+  const areaRatio = cardArea / refArea;
+
+  const side = quad.map((p, i) => {
+    const q = quad[(i + 1) % 4];
+    return Math.hypot(q[0] - p[0], q[1] - p[1]);
+  });
+  const aspect = Math.max(side[0], side[2]) / Math.max(1e-6, Math.max(side[1], side[3]));
 
   return {
     quad,
     areaRatio,
-    maxAngleDev,
+    aspect,
+    maxAngleDev: maxAngleDeviation(quad),
     touchesBorder: comp.touchesBorder,
     coverage,
-    minSide,
+    minSide: Math.min(...side),
+    centroid: comp.centroid,
     stage: "ok",
   };
 }
@@ -404,22 +532,32 @@ export function evaluateFrame(det, quality, cfg = {}, prevQuad = null) {
   out.hasDoc = true;
   out.quad = det.quad;
   out.areaRatio = det.areaRatio;
+  out.aspect = det.aspect;
   out.maxAngleDev = det.maxAngleDev;
   out.quality = quality;
 
   out.areaOk = det.areaRatio >= c.minAreaRatio;
   out.angleOk = det.maxAngleDev <= c.maxAngleDeg;
   out.cornersOk = !det.touchesBorder;
+  // Aspect is the gate that rejects non-documents. Without it any convex quad
+  // with right angles and enough area passes — a table edge, a monitor bezel,
+  // a door frame. A card has a fixed ID-1 ratio, so constrain it.
+  out.aspectOk = det.aspect === undefined
+    ? true
+    : Math.abs(det.aspect - c.guideAspect) / c.guideAspect <= c.aspectTolerance;
+  out.notTooLarge = det.areaRatio <= c.maxAreaRatio;
 
   if (!out.areaOk) out.reasons.push("move-closer");
+  if (!out.notTooLarge) out.reasons.push("move-back");
   if (!out.angleOk) out.reasons.push("tilt-invalid");
   if (!out.cornersOk) out.reasons.push("corners-clipped");
+  if (!out.aspectOk) out.reasons.push("wrong-shape");
   if (quality && !quality.ok) out.reasons.push(...quality.reasons);
 
   out.qualityOk = !!quality?.ok;
   // Geometry is fine but this tick did not sample quality: report it as
   // pending rather than letting the UI jump straight to a failure tip.
-  if (quality === null && out.areaOk && out.angleOk && out.cornersOk) {
+  if (quality === null && out.areaOk && out.angleOk && out.cornersOk && out.aspectOk && out.notTooLarge) {
     out.reasons.push("quality-pending");
   }
 
@@ -432,6 +570,7 @@ export function evaluateFrame(det, quality, cfg = {}, prevQuad = null) {
     out.stable = jitter <= c.maxCornerJitter;
   }
 
-  out.allGatesPass = out.hasDoc && out.areaOk && out.angleOk && out.cornersOk && out.qualityOk;
+  out.allGatesPass = out.hasDoc && out.areaOk && out.notTooLarge &&
+    out.angleOk && out.cornersOk && out.aspectOk && out.qualityOk;
   return out;
 }

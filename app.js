@@ -21,7 +21,12 @@ const QUALITY_INTERVAL_MS = 160;
 
 const CONFIG = {
   ...DEFAULT_CONFIG,
-  minAreaRatio: 0.28,
+  // Area is measured against the GUIDE rect, not the whole frame — this is the
+  // SDK's checkCardAreaRatio(cardQuad, frameQuad, min) semantics.
+  minAreaRatio: 0.55,
+  maxAreaRatio: 1.35,
+  guideAspect: 1.585,   // ID-1 landscape: 85.60 x 53.98 mm
+  aspectTolerance: 0.30,
   maxAngleDeg: 10,
   stackTime: 900,
   hysteresis: { enter: 1.0, exit: 0.8 },
@@ -29,18 +34,33 @@ const CONFIG = {
   brightnessMin: 50,
   brightnessMax: 220,
   glareMax: 0.05,
+  qualityMinCropWidth: 320,  // below this the capture is not worth keeping
+};
+
+// The capture rectangle is a centred LANDSCAPE rectangle, not a full-bleed
+// frame. Forcing the user to fill the whole viewport makes them hold the card
+// too close (blur, perspective, cast shadow) and tells the detector nothing
+// about where the card should be.
+const GUIDE = {
+  widthFrac: 0.88,     // fraction of available screen width
+  centerYFrac: 0.45,   // slightly above centre so the HUD does not overlap
+  marginPx: 14,
 };
 
 const TIPS = {
   "no-detection": "把证件放进框内",
   "no-component": "把证件放进框内",
+  "outside-guide": "把证件移进框内",
   "component-too-small": "靠近一点",
   "no-quad": "对准证件四角",
   "not-convex": "换个背景，避免杂物干扰",
-  "move-closer": "靠近一点，让证件占满框",
+  "move-closer": "靠近一点，让证件填满框",
+  "move-back": "离远一点，证件超出框了",
+  "wrong-shape": "只对准一张证件，四个角都露出来",
   "tilt-invalid": "手机端平，减少倾斜",
   "corners-clipped": "证件四个角都要在画面内",
   "crop-too-small": "靠近一点",
+  "low-resolution": "靠近一点，分辨率不够",
   blurry: "拿稳，保持清晰",
   "too-dark": "光线不足，换个位置",
   "too-bright": "光线太强，避开直射",
@@ -105,6 +125,53 @@ async function startCamera() {
 }
 
 /* ------------------------------------------------------------------ */
+/* layout: guide rect + screen <-> image mapping                       */
+/* ------------------------------------------------------------------ */
+
+/** object-fit: cover transform between video pixels and displayed pixels. */
+function coverTransform(dw, dh, vw, vh) {
+  const s = Math.max(dw / vw, dh / vh);
+  return { s, ox: (dw - vw * s) / 2, oy: (dh - vh * s) / 2 };
+}
+
+/** The capture rectangle in SCREEN coordinates: centred, landscape, card aspect. */
+function guideRectScreen(dw, dh) {
+  const availW = Math.max(1, dw - GUIDE.marginPx * 2);
+  const width = availW * GUIDE.widthFrac;
+  const height = width / CONFIG.guideAspect;
+  return {
+    x: (dw - width) / 2,
+    y: dh * GUIDE.centerYFrac - height / 2,
+    width,
+    height,
+  };
+}
+
+/**
+ * Resolve everything the tick and the renderer both need: the cover transform,
+ * the guide in screen space, and the guide in native video pixels. The guide is
+ * defined in screen space (so it looks right regardless of video aspect) and
+ * then mapped back into image space for the gates.
+ */
+function layout() {
+  const dw = overlay.clientWidth || window.innerWidth;
+  const dh = overlay.clientHeight || window.innerHeight;
+  const vw = video.videoWidth || 1;
+  const vh = video.videoHeight || 1;
+  const t = coverTransform(dw, dh, vw, vh);
+  const g = guideRectScreen(dw, dh);
+  const x0 = (g.x - t.ox) / t.s;
+  const y0 = (g.y - t.oy) / t.s;
+  const x1 = (g.x + g.width - t.ox) / t.s;
+  const y1 = (g.y + g.height - t.oy) / t.s;
+  return {
+    dw, dh, vw, vh, t,
+    guideScreen: g,
+    guideNative: { x: x0, y: y0, width: x1 - x0, height: y1 - y0 },
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* detection tick                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -124,16 +191,26 @@ function measureQuality(vw, vh) {
   const ch = Math.min(vh - cy, Math.ceil(r.height));
   if (cw < 24 || ch < 16) return { ok: false, reasons: ["crop-too-small"] };
 
-  const nh = Math.max(8, Math.round((NORM_W * ch) / cw));
-  qualCanvas.width = NORM_W;
+  // An ID needs enough pixels to be worth keeping. Below this the capture is
+  // useless for downstream OCR regardless of how sharp it looks.
+  if (cw < CONFIG.qualityMinCropWidth) {
+    return { ok: false, reasons: ["low-resolution"], cropWidth: cw };
+  }
+
+  // Normalise by DOWNSCALING only. Upscaling a small crop interpolates detail
+  // away and makes a perfectly sharp card measure as blurry, which would pin
+  // the blur gate permanently shut on low-resolution camera streams.
+  const targetW = Math.min(NORM_W, cw);
+  const nh = Math.max(8, Math.round((targetW * ch) / cw));
+  qualCanvas.width = targetW;
   qualCanvas.height = nh;
-  // Draw the card crop scaled to a fixed width: makes the blur floor
-  // independent of camera resolution.
-  qualCtx.drawImage(video, cx, cy, cw, ch, 0, 0, NORM_W, nh);
-  const img = qualCtx.getImageData(0, 0, NORM_W, nh);
-  const gray = toGray(img.data, NORM_W, nh);
-  const full = [[0, 0], [NORM_W - 1, 0], [NORM_W - 1, nh - 1], [0, nh - 1]];
-  return assessQuality(gray, NORM_W, nh, full, CONFIG);
+  qualCtx.drawImage(video, cx, cy, cw, ch, 0, 0, targetW, nh);
+  const img = qualCtx.getImageData(0, 0, targetW, nh);
+  const gray = toGray(img.data, targetW, nh);
+  const full = [[0, 0], [targetW - 1, 0], [targetW - 1, nh - 1], [0, nh - 1]];
+  const res = assessQuality(gray, targetW, nh, full, CONFIG);
+  res.cropWidth = cw;
+  return res;
 }
 
 function loop(t) {
@@ -159,11 +236,23 @@ function loop(t) {
   detCtx.drawImage(video, 0, 0, DET_W, dh);
   const frame = detCtx.getImageData(0, 0, DET_W, dh);
 
-  const t0 = performance.now();
-  const det = detectDocument(frame, CONFIG);
-  state.detMs = performance.now() - t0;
+  // Resolve layout once per tick and reuse it in the renderer.
+  const L = layout();
+  state.layout = L;
 
+  // Guide in detection-image coordinates. Detection runs at DET_W wide, so the
+  // native guide must be scaled down by the same factor.
   const scale = vw / DET_W;
+  const guideDet = {
+    x: L.guideNative.x / scale,
+    y: L.guideNative.y / scale,
+    width: L.guideNative.width / scale,
+    height: L.guideNative.height / scale,
+  };
+
+  const t0 = performance.now();
+  const det = detectDocument(frame, CONFIG, guideDet);
+  state.detMs = performance.now() - t0;
 
   if (!det || det.failed) {
     state.quadSmooth = null;
@@ -177,14 +266,17 @@ function loop(t) {
     // Hysteresis: once timing, tolerate a slightly smaller card so the
     // progress bar does not reset on tiny hand movements.
     const relaxed = state.stableSince != null;
-    const areaMin = relaxed
-      ? CONFIG.minAreaRatio * CONFIG.hysteresis.exit
-      : CONFIG.minAreaRatio * CONFIG.hysteresis.enter;
+    const areaMin = CONFIG.minAreaRatio *
+      (relaxed ? CONFIG.hysteresis.exit : CONFIG.hysteresis.enter);
+    const aspectOk =
+      Math.abs(det.aspect - CONFIG.guideAspect) / CONFIG.guideAspect <= CONFIG.aspectTolerance;
 
     const geometryOk =
       det.areaRatio >= areaMin &&
+      det.areaRatio <= CONFIG.maxAreaRatio &&
       det.maxAngleDev <= CONFIG.maxAngleDeg &&
-      !det.touchesBorder;
+      !det.touchesBorder &&
+      aspectOk;
 
     if (geometryOk) {
       if (t - state.lastQualityAt > QUALITY_INTERVAL_MS || !state.quality) {
@@ -228,29 +320,43 @@ function render() {
   octx.setTransform(dpr, 0, 0, dpr, 0, 0);
   octx.clearRect(0, 0, dw, dh);
 
-  // video -> display mapping for object-fit: cover
-  const vw = video.videoWidth || 1;
-  const vh = video.videoHeight || 1;
-  const s = Math.max(dw / vw, dh / vh);
-  const ox = (dw - vw * s) / 2;
-  const oy = (dh - vh * s) / 2;
-  const toDisplay = ([x, y]) => [x * s + ox, y * s + oy];
+  // Reuse the transform resolved in the tick so the guide and the detected
+  // quad are guaranteed to share one coordinate mapping.
+  const L = state.layout ?? layout();
+  const { t } = L;
+  const toDisplay = ([x, y]) => [x * t.s + t.ox, y * t.s + t.oy];
 
   const v = state.verdict;
   const pass = !!v?.allGatesPass;
 
-  // guide frame
-  const inset = Math.min(dw, dh) * 0.08;
-  const gx = inset, gy = inset;
-  const gw = dw - inset * 2, gh = dh - inset * 2;
-  const arm = Math.min(gw, gh) * 0.12;
-  octx.lineWidth = 3;
-  octx.strokeStyle = pass ? "rgba(60,220,140,0.95)" : "rgba(255,255,255,0.55)";
+  // ---- capture rectangle: centred landscape, card aspect ----
+  const g = L.guideScreen;
+  const r = Math.min(14, g.height * 0.14);
+
+  // Dim everything outside the guide so the target area reads unambiguously.
+  octx.save();
   octx.beginPath();
+  octx.rect(0, 0, dw, dh);
+  octx.roundRect(g.x, g.y, g.width, g.height, r);
+  octx.fillStyle = "rgba(0,0,0,0.42)";
+  octx.fill("evenodd");
+  octx.restore();
+
+  octx.lineWidth = 2;
+  octx.strokeStyle = pass ? "rgba(60,220,140,0.95)" : "rgba(255,255,255,0.5)";
+  octx.beginPath();
+  octx.roundRect(g.x, g.y, g.width, g.height, r);
+  octx.stroke();
+
+  // corner brackets, sized to the guide rather than the viewport
+  const arm = Math.min(g.width, g.height) * 0.16;
   const corners = [
-    [gx, gy, 1, 1], [gx + gw, gy, -1, 1],
-    [gx + gw, gy + gh, -1, -1], [gx, gy + gh, 1, -1],
+    [g.x, g.y, 1, 1], [g.x + g.width, g.y, -1, 1],
+    [g.x + g.width, g.y + g.height, -1, -1], [g.x, g.y + g.height, 1, -1],
   ];
+  octx.lineWidth = 4;
+  octx.strokeStyle = pass ? "rgba(60,220,140,1)" : "rgba(255,255,255,0.85)";
+  octx.beginPath();
   for (const [cx, cy, sx, sy] of corners) {
     octx.moveTo(cx + sx * arm, cy);
     octx.lineTo(cx, cy);
@@ -258,7 +364,7 @@ function render() {
   }
   octx.stroke();
 
-  // detected quad
+  // ---- detected quad ----
   if (state.quadNative) {
     octx.beginPath();
     state.quadNative.forEach((p, i) => {
@@ -273,7 +379,7 @@ function render() {
     octx.fill();
   }
 
-  // progress arc across the top
+  // progress bar across the top
   if (state.progress > 0) {
     octx.fillStyle = "rgba(60,220,140,0.9)";
     octx.fillRect(0, 0, dw * state.progress, 4);
@@ -287,7 +393,9 @@ function render() {
 
   debugEl.textContent =
     `${state.fps}fps · det ${state.detMs.toFixed(1)}ms` +
-    (v?.quad ? ` · area ${(v.areaRatio ?? 0).toFixed(2)} · ang ${(v.maxAngleDev ?? 0).toFixed(0)}°` : "") +
+    (v?.quad
+      ? ` · fill ${(v.areaRatio ?? 0).toFixed(2)} · ar ${(v.aspect ?? 0).toFixed(2)} · ang ${(v.maxAngleDev ?? 0).toFixed(0)}°`
+      : "") +
     (state.quality ? ` · sharp ${(state.quality.sharpness ?? 0).toFixed(0)} · lum ${(state.quality.brightness ?? 0).toFixed(0)}` : "");
 }
 
@@ -409,3 +517,7 @@ startBtn.addEventListener("click", async () => {
 
 // Keep the overlay sized to the viewport.
 new ResizeObserver(() => render()).observe(document.body);
+
+// Diagnostics hook: lets the debug line, tests and the console inspect live
+// state (resolved guide, smoothed quad, verdicts) without re-deriving it.
+window.__docscan = { state, CONFIG, GUIDE, layout };

@@ -1,7 +1,7 @@
 // Synthetic-image tests for the classical-CV document detector.
 // Run: node test/detect.test.mjs
 
-import { detectDocument, DEFAULT_CONFIG } from "../detect.js";
+import { detectDocument, evaluateFrame, DEFAULT_CONFIG } from "../detect.js";
 import { orderQuad, polygonArea } from "../geometry.js";
 
 const W = 320, H = 240;
@@ -162,6 +162,75 @@ function check(name, cond, detail = "") {
     check("picked the larger card", errBig < errSmall, `errBig=${errBig.toFixed(1)} errSmall=${errSmall.toFixed(1)}`);
     check("larger card located accurately", errBig < 15, `err=${errBig.toFixed(1)}px`);
   }
+}
+
+/* ---------------- case 7: aspect gate rejects non-card shapes ---------------- */
+{
+  console.log("\ncase 7: square quad must fail the aspect gate");
+  // A square is a convex, right-angled, well-sized quad — every gate except
+  // aspect passes. This is exactly the shape that used to slip through.
+  const square = [[90, 60], [230, 60], [230, 200], [90, 200]];
+  const img = blank();
+  fill(img, square, [236, 234, 228]);
+  const det = detectDocument(img);
+  check("detected", !!det && !det.failed, det?.failed ? `failed=${det.failed}` : "");
+  if (det && !det.failed) {
+    check("aspect near 1.0", Math.abs(det.aspect - 1) < 0.12, `aspect=${det.aspect.toFixed(2)}`);
+    const v = evaluateFrame(det, { ok: true }, {});
+    check("aspect gate rejects it", v.aspectOk === false, `aspectOk=${v.aspectOk}`);
+    check("allGatesPass false", v.allGatesPass === false);
+  }
+}
+
+/* ---------------- case 8: area is relative to the GUIDE ---------------- */
+{
+  console.log("\ncase 8: areaRatio measured against the guide rect");
+  // Card occupies ~31% of the image but ~95% of the guide, so the guide-relative
+  // number must be far larger. This is the SDK's frameQuad semantics.
+  const card = [[110, 70], [225, 78], [220, 150], [105, 142]];
+  const img = blank();
+  fill(img, card, [236, 234, 228]);
+  const imageRel = detectDocument(img);
+  const guide = { x: 100, y: 62, width: 135, height: 96 };
+  const guideRel = detectDocument(img, {}, guide);
+  check("both detected", !!imageRel && !imageRel.failed && !!guideRel && !guideRel.failed);
+  if (imageRel && !imageRel.failed && guideRel && !guideRel.failed) {
+    check("guide-relative is much larger",
+      guideRel.areaRatio > imageRel.areaRatio * 2.5,
+      `image=${imageRel.areaRatio.toFixed(3)} guide=${guideRel.areaRatio.toFixed(3)}`);
+    check("image-relative would fail a 0.55 gate", imageRel.areaRatio < 0.55,
+      `=${imageRel.areaRatio.toFixed(3)}`);
+    check("guide-relative passes a 0.55 gate", guideRel.areaRatio >= 0.55,
+      `=${guideRel.areaRatio.toFixed(3)}`);
+  }
+}
+
+/* ---------------- case 9: clutter outside the guide is ignored ---------------- */
+{
+  console.log("\ncase 9: large background blob outside the guide is not chosen");
+  const clutter = [[5, 5], [300, 5], [300, 40], [5, 40]];   // wide band, off-guide
+  const card = [[110, 95], [225, 103], [220, 175], [105, 167]];
+  const img = blank();
+  fill(img, clutter, [220, 218, 214]);
+  fill(img, card, [238, 236, 230]);
+  const guide = { x: 100, y: 88, width: 135, height: 96 };
+  const det = detectDocument(img, {}, guide);
+  check("detected", !!det && !det.failed, det?.failed ? `failed=${det.failed}` : "");
+  if (det && !det.failed) {
+    check("chose the in-guide card", maxCornerError(det.quad, card) < 15,
+      `err(card)=${maxCornerError(det.quad, card).toFixed(1)} err(clutter)=${maxCornerError(det.quad, clutter).toFixed(1)}`);
+  }
+}
+
+/* ---------------- case 10: nothing inside the guide is reported distinctly --- */
+{
+  console.log("\ncase 10: card present but outside the guide");
+  const card = [[10, 8], [120, 14], [116, 78], [6, 72]];
+  const img = blank();
+  fill(img, card, [236, 234, 228]);
+  const guide = { x: 150, y: 140, width: 150, height: 95 };
+  const det = detectDocument(img, {}, guide);
+  check("reports outside-guide", det?.failed === "outside-guide", `failed=${det?.failed}`);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
