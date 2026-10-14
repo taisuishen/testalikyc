@@ -50,29 +50,31 @@ export function toGray(rgba, w, h) {
   return g;
 }
 
-/** Separable 5x5 gaussian, kernel [1,4,6,4,1]/16. */
+/**
+ * Separable 3x3 binomial gaussian, kernel [1,2,1]/4.
+ *
+ * The 5x5 [1,4,6,4,1] version measured 3.2ms of a 5.7ms frame at 320x240 —
+ * over half the budget — and low-end Android is roughly 10x slower than the
+ * desktop V8 used for that measurement. Detection runs on a 320px-wide frame
+ * whose edge features are many pixels wide, so the extra 5x5 smoothing buys
+ * nothing that the dilation stage does not already recover.
+ */
 export function gaussianBlur(gray, w, h) {
-  const k = [1, 4, 6, 4, 1];
+  const k = [1, 2, 1];
   const tmp = new Uint8ClampedArray(w * h);
   const out = new Uint8ClampedArray(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      let s = 0;
-      for (let i = -2; i <= 2; i++) {
-        const xx = Math.min(w - 1, Math.max(0, x + i));
-        s += gray[y * w + xx] * k[i + 2];
-      }
-      tmp[y * w + x] = s / 16;
+      const xm = x > 0 ? x - 1 : 0;
+      const xp = x < w - 1 ? x + 1 : w - 1;
+      tmp[y * w + x] = (gray[y * w + xm] + 2 * gray[y * w + x] + gray[y * w + xp]) / 4;
     }
   }
   for (let y = 0; y < h; y++) {
+    const ym = y > 0 ? y - 1 : 0;
+    const yp = y < h - 1 ? y + 1 : h - 1;
     for (let x = 0; x < w; x++) {
-      let s = 0;
-      for (let i = -2; i <= 2; i++) {
-        const yy = Math.min(h - 1, Math.max(0, y + i));
-        s += tmp[yy * w + x] * k[i + 2];
-      }
-      out[y * w + x] = s / 16;
+      out[y * w + x] = (tmp[ym * w + x] + 2 * tmp[y * w + x] + tmp[yp * w + x]) / 4;
     }
   }
   return out;
@@ -150,53 +152,91 @@ export function dilate(bin, w, h, iterations = 1) {
 }
 
 /**
- * Pick the component that best represents the document.
+ * Pick the component that best represents the document, and return its edge
+ * extremes rather than every pixel.
+ *
+ * Why extremes: the hull of a rasterised blob is fully determined by the
+ * min/max-x of each row and the min/max-y of each column. Every hull vertex has
+ * a supporting line; if that line is more vertical the vertex is a row
+ * x-extreme, otherwise it is a column y-extreme. So the union of those extremes
+ * has exactly the same convex hull, while being at most ~2(w+h) points instead
+ * of one entry per pixel.
+ *
+ * That matters a lot in practice: a phone body filling the frame is a component
+ * of ~30k pixels at 256px, and building + sorting that point list measured
+ * 21-40ms per frame in Chrome (a 1.2ms early-exit path next to it). The extreme
+ * set is ~900 points worst case and usually a few dozen.
  *
  * `guide` (optional, in this image's coordinate space) is the on-screen capture
- * rectangle. When supplied, only components whose centroid lands inside the
- * guide (plus a little slack) are eligible. That containment test is a hard
- * filter rather than a score bonus, because a table edge or monitor bezel in
- * the background can easily be larger than the card and would otherwise win.
+ * rectangle. When supplied, a component must clear three plausibility tests:
  *
- * Selection is by bounding-box AREA, not raw pixel count: a card outline is a
- * thin ring whose pixel count is far below the area it encloses, so counting
- * pixels favours dense background texture over the card border.
+ *   1. centroid inside the guide (plus slack) — not enough alone, since the
+ *      phone body or a monitor behind the card also covers the guide;
+ *   2. bounding-box aspect close to the guide's — real captures showed a phone
+ *      body winning at aspect 0.67 against a landscape guide;
+ *   3. bounding-box area not grossly larger than the guide — the same captures
+ *      showed the winner at 2.25-2.43x the guide area.
  *
- * `touchesBorder` is the practical test for "all four corners visible" — a card
- * partly out of frame yields a blob clipped by the image edge.
+ * Selection among survivors is by bounding-box area, not pixel count: a card
+ * outline is a thin ring whose pixel count is far below the area it encloses.
  */
-export function selectComponent(bin, w, h, guide = null) {
+export function selectComponent(bin, w, h, guide = null, cfg = {}) {
+  const c = { ...DEFAULT_CONFIG, ...cfg };
   const seen = new Uint8Array(w * h);
   const stack = new Int32Array(w * h);
+
+  // Reused across components; only touched rows/columns are reset.
+  const rowMinX = new Int32Array(h).fill(w);
+  const rowMaxX = new Int32Array(h).fill(-1);
+  const colMinY = new Int32Array(w).fill(h);
+  const colMaxY = new Int32Array(w).fill(-1);
+  const touchedRows = [];
+  const touchedCols = [];
+
   const slack = 0.10;
   const gx0 = guide ? guide.x - guide.width * slack : 0;
   const gy0 = guide ? guide.y - guide.height * slack : 0;
   const gx1 = guide ? guide.x + guide.width * (1 + slack) : w;
   const gy1 = guide ? guide.y + guide.height * (1 + slack) : h;
 
+  const bboxAspectTol = Math.max(c.aspectTolerance, 0.45);
+  const bboxMaxAreaFactor = 1.8;
+
   let best = null;
   let bestScore = -1;
   let sawAny = false;
+  let sawInGuide = false;
 
   for (let start = 0; start < bin.length; start++) {
     if (!bin[start] || seen[start]) continue;
+
+    touchedRows.length = 0;
+    touchedCols.length = 0;
     let sp = 0;
     stack[sp++] = start;
     seen[start] = 1;
-    const pixels = [];
+
     let count = 0, sumX = 0, sumY = 0;
     let minX = w, minY = h, maxX = -1, maxY = -1, touches = false;
 
     while (sp > 0) {
       const idx = stack[--sp];
-      pixels.push(idx);
       const x = idx % w, y = (idx / w) | 0;
       count++; sumX += x; sumY += y;
+
+      if (rowMinX[y] === w) touchedRows.push(y);
+      if (rowMinX[y] > x) rowMinX[y] = x;
+      if (rowMaxX[y] < x) rowMaxX[y] = x;
+      if (colMinY[x] === h) touchedCols.push(x);
+      if (colMinY[x] > y) colMinY[x] = y;
+      if (colMaxY[x] < y) colMaxY[x] = y;
+
       if (x < minX) minX = x;
       if (x > maxX) maxX = x;
       if (y < minY) minY = y;
       if (y > maxY) maxY = y;
       if (x === 0 || y === 0 || x === w - 1 || y === h - 1) touches = true;
+
       for (let dy = -1; dy <= 1; dy++) {
         const yy = y + dy;
         if (yy < 0 || yy >= h) continue;
@@ -211,21 +251,45 @@ export function selectComponent(bin, w, h, guide = null) {
 
     sawAny = true;
     const cx = sumX / count, cy = sumY / count;
-    if (guide && (cx < gx0 || cx > gx1 || cy < gy0 || cy > gy1)) continue;
+    const inGuide = !guide || (cx >= gx0 && cx <= gx1 && cy >= gy0 && cy <= gy1);
+    if (inGuide) sawInGuide = true;
 
-    const bboxArea = (maxX - minX + 1) * (maxY - minY + 1);
-    if (bboxArea > bestScore) {
+    const bw = maxX - minX + 1, bh = maxY - minY + 1;
+    const bboxArea = bw * bh;
+
+    let eligible = inGuide;
+    if (eligible && guide) {
+      const aspect = bw / Math.max(1e-6, bh);
+      if (Math.abs(aspect - c.guideAspect) / c.guideAspect > bboxAspectTol) eligible = false;
+      else if (bboxArea > guide.width * guide.height * bboxMaxAreaFactor) eligible = false;
+    }
+
+    if (eligible && bboxArea > bestScore) {
+      // Materialise the extreme set only for the current best candidate; a
+      // later, larger component simply replaces it.
+      const points = [];
+      for (const y of touchedRows) {
+        points.push([rowMinX[y], y], [rowMaxX[y], y]);
+      }
+      for (const x of touchedCols) {
+        points.push([x, colMinY[x]], [x, colMaxY[x]]);
+      }
       bestScore = bboxArea;
       best = {
-        pixels,
+        points,
         count,
         touchesBorder: touches,
-        bbox: { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 },
+        bbox: { x: minX, y: minY, width: bw, height: bh },
         centroid: [cx, cy],
       };
     }
+
+    // Reset only what this component touched.
+    for (const y of touchedRows) { rowMinX[y] = w; rowMaxX[y] = -1; }
+    for (const x of touchedCols) { colMinY[x] = h; colMaxY[x] = -1; }
   }
-  return { component: best, sawAny };
+
+  return { component: best, sawAny, sawInGuide };
 }
 
 /* ------------------------------------------------------------------ */
@@ -416,11 +480,14 @@ export function detectDocument(img, cfg = {}, guide = null) {
   const { bin } = binarize(mag, w, h);
   const dil = dilate(bin, w, h, 2);
 
-  const { component: comp, sawAny } = selectComponent(dil, w, h, guide);
+  const { component: comp, sawAny, sawInGuide } = selectComponent(dil, w, h, guide, c);
   if (!comp) {
-    // Distinguish "nothing anywhere" from "something, but not in the guide"
-    // so the UI can say "put it in the frame" rather than "no document".
-    return { failed: sawAny && guide ? "outside-guide" : "no-component" };
+    // Three distinct outcomes, three distinct tips: nothing anywhere, something
+    // present but not in the guide, or something in the guide that is plainly
+    // not a card (wrong shape or far too large).
+    if (!sawAny) return { failed: "no-component" };
+    if (!sawInGuide) return { failed: "outside-guide" };
+    return { failed: "implausible-component" };
   }
 
   // Keep this floor low: a genuinely small card must still produce a quad so
@@ -428,14 +495,9 @@ export function detectDocument(img, cfg = {}, guide = null) {
   const coverage = comp.count / (w * h);
   if (coverage < 0.005) return { failed: "component-too-small", coverage };
 
-  // Subsample for hull cost; hull is unaffected at these densities.
-  const pts = [];
-  const step = comp.pixels.length > 4000 ? 2 : 1;
-  for (let i = 0; i < comp.pixels.length; i += step) {
-    const idx = comp.pixels[i];
-    pts.push([idx % w, (idx / w) | 0]);
-  }
-  const hull = convexHull(pts);
+  // The component already carries its edge extremes (identical convex hull,
+  // at most ~2(w+h) points instead of one per pixel).
+  const hull = convexHull(comp.points);
   const quadRaw = approxQuad(hull);
   if (!quadRaw) return { failed: "no-quad", coverage };
 
@@ -547,11 +609,15 @@ export function evaluateFrame(det, quality, cfg = {}, prevQuad = null) {
     : Math.abs(det.aspect - c.guideAspect) / c.guideAspect <= c.aspectTolerance;
   out.notTooLarge = det.areaRatio <= c.maxAreaRatio;
 
+  // Order matters: reasons[0] is what the UI shows. Report "this is the wrong
+  // shape" before "move back", because a grossly oversized quad is almost
+  // always the detector locked onto the phone body or a monitor rather than
+  // the user standing too close.
+  if (!out.aspectOk) out.reasons.push("wrong-shape");
+  if (!out.cornersOk) out.reasons.push("corners-clipped");
   if (!out.areaOk) out.reasons.push("move-closer");
   if (!out.notTooLarge) out.reasons.push("move-back");
   if (!out.angleOk) out.reasons.push("tilt-invalid");
-  if (!out.cornersOk) out.reasons.push("corners-clipped");
-  if (!out.aspectOk) out.reasons.push("wrong-shape");
   if (quality && !quality.ok) out.reasons.push(...quality.reasons);
 
   out.qualityOk = !!quality?.ok;

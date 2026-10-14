@@ -6,6 +6,11 @@
   "description": "Document capture H5: card detection, auto-capture, perspective correction",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node test/detect.test.mjs"
+    "test": "node test/detect.test.mjs",
+    "analyze": "node tools/analyze-debug.mjs",
+    "analyze:dump": "node tools/analyze-debug.mjs --dump 25"
+  },
+  "devDependencies": {
+    "jpeg-js": "^0.4.4"
   }
 }

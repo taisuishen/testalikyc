@@ -14,10 +14,10 @@ import {
 } from "./detect.js";
 import { solveHomography, warpPerspective, boundingRect } from "./geometry.js";
 
-const DET_W = 320;            // detection resolution (width)
+const DET_W = 256;            // detection resolution (width); 256 keeps phone cost sane
 const NORM_W = 600;           // quality normalisation width
 const DET_INTERVAL_MS = 80;   // ~12 Hz detection
-const QUALITY_INTERVAL_MS = 160;
+const QUALITY_INTERVAL_MS = 260;
 
 const CONFIG = {
   ...DEFAULT_CONFIG,
@@ -51,6 +51,7 @@ const TIPS = {
   "no-detection": "把证件放进框内",
   "no-component": "把证件放进框内",
   "outside-guide": "把证件移进框内",
+  "implausible-component": "只对准一张证件，别把手机/屏幕当证件",
   "component-too-small": "靠近一点",
   "no-quad": "对准证件四角",
   "not-convex": "换个背景，避免杂物干扰",
@@ -79,9 +80,13 @@ const resultInfo = el("resultInfo");
 const retakeBtn = el("retake");
 const debugEl = el("debug");
 const startBtn = el("start");
+const collectBtn = el("collect");
 
 const detCanvas = document.createElement("canvas");
 const detCtx = detCanvas.getContext("2d", { willReadFrequently: true });
+// Mobile GPU->CPU readback and high-quality downscale are both expensive;
+// we blur immediately afterwards, so cheapest smoothing is fine.
+detCtx.imageSmoothingQuality = "low";
 const qualCanvas = document.createElement("canvas");
 const qualCtx = qualCanvas.getContext("2d", { willReadFrequently: true });
 const capCanvas = document.createElement("canvas");
@@ -102,7 +107,20 @@ const state = {
   detMs: 0,
   fps: 0,
   frameTimes: [],
+  // last raw detector output + the guide it was given, kept so a collected
+  // sample can be replayed offline against the exact same input
+  lastDet: null,
+  lastGuideDet: null,
+  collecting: false,
+  samplesSent: 0,
+  samplesFailed: 0,
+  lastSampleAt: 0,
 };
+
+// Sampling cadence. Each sample is one 256px JPEG (~10-20KB) plus its
+// metadata, so ~1.4 samples/s keeps a LAN link comfortable while still
+// covering a full approach-and-align motion.
+const COLLECT_INTERVAL_MS = 700;
 
 /* ------------------------------------------------------------------ */
 /* camera                                                              */
@@ -253,6 +271,9 @@ function loop(t) {
   const t0 = performance.now();
   const det = detectDocument(frame, CONFIG, guideDet);
   state.detMs = performance.now() - t0;
+  state.lastDet = det;
+  state.lastGuideDet = guideDet;
+  state.lastFrameSize = [DET_W, dh];
 
   if (!det || det.failed) {
     state.quadSmooth = null;
@@ -296,13 +317,97 @@ function loop(t) {
   if (pass) {
     if (state.stableSince == null) state.stableSince = t;
     state.progress = Math.min(1, (t - state.stableSince) / CONFIG.stackTime);
-    if (state.progress >= 1 && !state.captured) capture();
+    // Collection mode suppresses the capture: firing it stops the loop, which
+    // is exactly what you do NOT want while recording a debugging session.
+    if (state.progress >= 1 && !state.captured && !state.collecting) capture();
   } else {
     state.stableSince = null;
     state.progress = 0;
   }
 
+  collectSample(t);
   render();
+}
+
+/* ------------------------------------------------------------------ */
+/* real-device sample collection                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Ship one sample to the LAN server: the EXACT detection-resolution frame the
+ * detector saw, plus every number needed to reproduce the decision.
+ *
+ * Sending the detector's own 256px input (rather than the full-resolution
+ * camera frame) is deliberate: detection runs entirely at that scale, so the
+ * thumbnail is sufficient to replay detectDocument() offline and reproduce a
+ * failure deterministically — while avoiding shipping legible, high-resolution
+ * identity documents around the network.
+ */
+function collectSample(t) {
+  if (!state.collecting) return;
+  if (t - state.lastSampleAt < COLLECT_INTERVAL_MS) return;
+  state.lastSampleAt = t;
+
+  const det = state.lastDet;
+  const v = state.verdict;
+  const meta = {
+    detMs: Number(state.detMs.toFixed(2)),
+    fps: state.fps,
+    video: [video.videoWidth, video.videoHeight],
+    detFrame: state.lastFrameSize ?? [detCanvas.width, detCanvas.height],
+    guideDet: state.lastGuideDet,
+    guideNative: state.layout?.guideNative,
+    failed: det?.failed ?? null,
+    detected: det && !det.failed ? {
+      quad: det.quad?.map((p) => p.map((n) => Number(n.toFixed(2)))),
+      areaRatio: Number(det.areaRatio?.toFixed(4)),
+      aspect: Number(det.aspect?.toFixed(4)),
+      maxAngleDev: Number(det.maxAngleDev?.toFixed(2)),
+      touchesBorder: det.touchesBorder,
+      coverage: Number(det.coverage?.toFixed(5)),
+      centroid: det.centroid?.map((n) => Number(n.toFixed(1))),
+      minSide: Number(det.minSide?.toFixed(1)),
+    } : null,
+    gates: v ? {
+      hasDoc: v.hasDoc, areaOk: v.areaOk, notTooLarge: v.notTooLarge,
+      angleOk: v.angleOk, cornersOk: v.cornersOk, aspectOk: v.aspectOk,
+      qualityOk: v.qualityOk, allGatesPass: v.allGatesPass,
+    } : null,
+    reasons: v?.reasons ?? [],
+    quality: state.quality,
+    progress: Number(state.progress.toFixed(2)),
+    config: {
+      minAreaRatio: CONFIG.minAreaRatio, maxAreaRatio: CONFIG.maxAreaRatio,
+      guideAspect: CONFIG.guideAspect, aspectTolerance: CONFIG.aspectTolerance,
+      maxAngleDeg: CONFIG.maxAngleDeg,
+    },
+  };
+
+  detCanvas.toBlob(async (blob) => {
+    if (!blob) return;
+    try {
+      const r = await fetch("/api/debug", {
+        method: "POST",
+        headers: {
+          "Content-Type": "image/jpeg",
+          "X-Debug-Meta": encodeURIComponent(JSON.stringify(meta)),
+        },
+        body: blob,
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      state.samplesSent++;
+    } catch {
+      state.samplesFailed++;
+    }
+    updateCollectUI();
+  }, "image/jpeg", 0.6);
+}
+
+function updateCollectUI() {
+  collectBtn.dataset.on = state.collecting ? "1" : "0";
+  collectBtn.textContent = state.collecting
+    ? `采集中 ${state.samplesSent}${state.samplesFailed ? ` (失败 ${state.samplesFailed})` : ""}`
+    : `采集样本${state.samplesSent ? ` ${state.samplesSent}` : ""}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -502,6 +607,13 @@ function retake() {
 /* ------------------------------------------------------------------ */
 
 retakeBtn.addEventListener("click", retake);
+
+collectBtn.addEventListener("click", () => {
+  state.collecting = !state.collecting;
+  state.lastSampleAt = 0;
+  updateCollectUI();
+});
+updateCollectUI();
 
 startBtn.addEventListener("click", async () => {
   startBtn.disabled = true;

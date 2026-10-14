@@ -96,8 +96,28 @@ html, body {
   font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
   color: rgba(255, 255, 255, 0.68);
   text-shadow: 0 1px 2px #000;
-  max-width: 92vw;
+  max-width: 60vw;
   pointer-events: none;
+}
+
+#collect {
+  position: absolute;
+  right: 10px;
+  top: calc(10px + env(safe-area-inset-top));
+  z-index: 6;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #e8edf7;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 999px;
+  backdrop-filter: blur(8px);
+}
+#collect[data-on="1"] {
+  color: #08130d;
+  background: #ffc400;
+  border-color: #ffc400;
 }
 
 #result {
